@@ -1,5 +1,11 @@
 //! A demonstration of an offchain worker that sends onchain callbacks
 
+// 我这里使用的是offchain_unsigned_tx_signed_payload/ 不签名但具签名信息的交易
+// 通过查看文档中相关的解释  https://substrate.dev/docs/zh-CN/knowledgebase/learn-substrate/extrinsics
+// 签名交易的作用简单理解有两个特点: 1.需要支付打包费用 2.更安全
+// 基于这两个原因，存储价格信息，选择了"不签名但具签名信息的交易"
+// 即: 我们不想因为存储这个数据而支付打包费用，同时要保证一定的安全性。
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(test)]
