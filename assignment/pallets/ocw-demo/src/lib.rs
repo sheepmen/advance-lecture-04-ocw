@@ -51,8 +51,7 @@ pub const NUM_VEC_LEN: usize = 10;
 pub const UNSIGNED_TXS_PRIORITY: u64 = 100;
 
 // We are fetching information from the github public API about organization`substrate-developer-hub`.
-pub const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
-pub const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
+pub const HTTP_REMOTE_REQUEST: &str = "https://api.coincap.io/v2/assets/polkadot";
 
 pub const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 pub const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -103,14 +102,19 @@ impl <T: SigningTypes> SignedPayload<T> for Payload<T::Public> {
 }
 
 // ref: https://serde.rs/container-attrs.html#crate
-#[derive(Deserialize, Encode, Decode, Default)]
-struct GithubInfo {
+#[allow(non_snake_case)]
+#[derive(Deserialize, Encode, Decode, Clone, Default)]
+struct DotPriceData {
 	// Specify our own deserializing function to convert JSON string to vector of bytes
 	#[serde(deserialize_with = "de_string_to_bytes")]
-	login: Vec<u8>,
-	#[serde(deserialize_with = "de_string_to_bytes")]
-	blog: Vec<u8>,
-	public_repos: u32,
+	priceUsd: Vec<u8>,
+}
+#[allow(non_snake_case)]
+#[derive(Deserialize, Encode, Decode, Clone, Default)]
+struct DotPriceInfo {
+	// Specify our own deserializing function to convert JSON string to vector of bytes
+	data: DotPriceData,
+	timestamp: u64,
 }
 
 pub fn de_string_to_bytes<'de, D>(de: D) -> Result<Vec<u8>, D::Error>
@@ -121,16 +125,15 @@ where
 	Ok(s.as_bytes().to_vec())
 }
 
-impl fmt::Debug for GithubInfo {
+impl fmt::Debug for DotPriceInfo {
 	// `fmt` converts the vector of bytes inside the struct back to string for
 	//   more friendly display.
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
-			"{{ login: {}, blog: {}, public_repos: {} }}",
-			str::from_utf8(&self.login).map_err(|_| fmt::Error)?,
-			str::from_utf8(&self.blog).map_err(|_| fmt::Error)?,
-			&self.public_repos
+			"{{ price: {}, timestamp: {}}}",
+			str::from_utf8(&self.data.priceUsd).map_err(|_| fmt::Error)?,
+			self.timestamp
 		)
 	}
 }
@@ -180,6 +183,7 @@ decl_error! {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+		CanNotGetLock,
 	}
 }
 
@@ -224,24 +228,16 @@ decl_module! {
 
 		fn offchain_worker(block_number: T::BlockNumber) {
 			debug::info!("Entering off-chain worker");
-
-			// Here we are showcasing various techniques used when running off-chain workers (ocw)
-			// 1. Sending signed transaction from ocw
-			// 2. Sending unsigned transaction from ocw
-			// 3. Sending unsigned transactions with signed payloads from ocw
-			// 4. Fetching JSON via http requests in ocw
-			const TX_TYPES: u32 = 4;
-			let modu = block_number.try_into().map_or(TX_TYPES, |bn: usize| (bn as u32) % TX_TYPES);
-			let result = match modu {
-				0 => Self::offchain_signed_tx(block_number),
-				1 => Self::offchain_unsigned_tx(block_number),
-				2 => Self::offchain_unsigned_tx_signed_payload(block_number),
-				3 => Self::fetch_github_info(),
-				_ => Err(Error::<T>::UnknownOffchainMux),
-			};
-
-			if let Err(e) = result {
-				debug::error!("offchain_worker error: {:?}", e);
+			match Self::fetch_github_info() {
+				Ok(info) => {
+					debug::error!("[XXX_DEBUG] offchain_worker success: {:?}", info);
+					if let Err(err) = Self::offchain_unsigned_tx_signed_payload(block_number, info) {
+						debug::error!("[XXX_DEBUG] offchain_worker offchain_unsigned_tx_signed_payload error: {:?}", err);
+					}
+				},
+				Err(e) => {
+					debug::error!("[XXX_DEBUG] offchain_worker fetch_github_info error: {:?}", e);
+				}
 			}
 		}
 	}
@@ -263,7 +259,7 @@ impl<T: Trait> Module<T> {
 	/// Check if we have fetched github info before. If yes, we can use the cached version
 	///   stored in off-chain worker storage `storage`. If not, we fetch the remote info and
 	///   write the info into the storage for future retrieval.
-	fn fetch_github_info() -> Result<(), Error<T>> {
+	fn fetch_github_info() -> Result<DotPriceInfo, Error<T>> {
 		// Create a reference to Local Storage value.
 		// Since the local storage is common for all offchain workers, it's a good practice
 		// to prepend our entry with the pallet name.
@@ -278,10 +274,9 @@ impl<T: Trait> Module<T> {
 		// the storage comprehensively.
 		//
 		// Ref: https://substrate.dev/rustdocs/v2.0.0/sp_runtime/offchain/storage/struct.StorageValueRef.html
-		if let Some(Some(gh_info)) = s_info.get::<GithubInfo>() {
+		if let Some(Some(price_info)) = s_info.get::<DotPriceInfo>() {
 			// gh-info has already been fetched. Return early.
-			debug::info!("cached gh-info: {:?}", gh_info);
-			return Ok(());
+			debug::info!("[XXX_DEBUG] before price-info: {:?}", price_info);
 		}
 
 		// Since off-chain storage can be accessed by off-chain workers from multiple runs, it is important to lock
@@ -302,17 +297,20 @@ impl<T: Trait> Module<T> {
 		// We try to acquire the lock here. If failed, we know the `fetch_n_parse` part inside is being
 		//   executed by previous run of ocw, so the function just returns.
 		// ref: https://substrate.dev/rustdocs/v2.0.0/sp_runtime/offchain/storage_lock/struct.StorageLock.html#method.try_lock
-		if let Ok(_guard) = lock.try_lock() {
-			match Self::fetch_n_parse() {
-				Ok(gh_info) => { s_info.set(&gh_info); }
-				Err(err) => { return Err(err); }
+		let _guard = lock.try_lock().map_err(|_| <Error<T>>::CanNotGetLock);
+		match Self::fetch_n_parse() {
+			Ok(price_info) => {
+				s_info.set(&price_info);
+				Ok(price_info)
+			}
+			Err(err) => {
+				Err(err)
 			}
 		}
-		Ok(())
 	}
 
 	/// Fetch from remote and deserialize the JSON to a struct
-	fn fetch_n_parse() -> Result<GithubInfo, Error<T>> {
+	fn fetch_n_parse() -> Result<DotPriceInfo, Error<T>> {
 		let resp_bytes = Self::fetch_from_remote().map_err(|e| {
 			debug::error!("fetch_from_remote error: {:?}", e);
 			<Error<T>>::HttpFetchingError
@@ -323,9 +321,9 @@ impl<T: Trait> Module<T> {
 		debug::info!("{}", resp_str);
 
 		// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
-		let gh_info: GithubInfo =
+		let price_info: DotPriceInfo =
 			serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
-		Ok(gh_info)
+		Ok(price_info)
 	}
 
 	/// This function uses the `offchain::http` API to query the remote github information,
@@ -343,7 +341,6 @@ impl<T: Trait> Module<T> {
 		// For github API request, we also need to specify `user-agent` in http request header.
 		//   See: https://developer.github.com/v3/#user-agent-required
 		let pending = request
-			.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
 			.deadline(timeout) // Setting the timeout time
 			.send() // Sending the request out by the host
 			.map_err(|_| <Error<T>>::HttpFetchingError)?;
@@ -413,7 +410,7 @@ impl<T: Trait> Module<T> {
 			})
 	}
 
-	fn offchain_unsigned_tx_signed_payload(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+	fn offchain_unsigned_tx_signed_payload(block_number: T::BlockNumber, price: DotPriceInfo) -> Result<(), Error<T>> {
 		// Retrieve the signer to sign the payload
 		let signer = Signer::<T, T::AuthorityId>::any_account();
 
