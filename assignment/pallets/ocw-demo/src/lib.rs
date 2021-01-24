@@ -56,6 +56,7 @@ pub const HTTP_REMOTE_REQUEST: &str = "https://api.coincap.io/v2/assets/polkadot
 pub const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 pub const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
 pub const LOCK_BLOCK_EXPIRATION: u32 = 3; // in block number
+pub const PRICE_ACC: f32 = 1000.0;
 
 /// Based on the above `KeyTypeId` we need to generate a pallet-specific crypto type wrapper.
 /// We can utilize the supported crypto kinds (`sr25519`, `ed25519` and `ecdsa`) and augment
@@ -91,7 +92,7 @@ pub mod crypto {
 
 #[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
 pub struct Payload<Public> {
-	number: u32,
+	price: u32,
 	public: Public
 }
 
@@ -151,7 +152,7 @@ pub trait Trait: system::Trait + CreateSignedTransaction<Call<Self>> {
 decl_storage! {
 	trait Store for Module<T: Trait> as Example {
 		/// A vector of recently submitted numbers. Bounded by NUM_VEC_LEN
-		Numbers get(fn numbers): VecDeque<u32>;
+		Prices get(fn numbers): VecDeque<u32>;
 	}
 }
 
@@ -162,7 +163,7 @@ decl_event!(
 		AccountId = <T as system::Trait>::AccountId,
 	{
 		/// Event generated when a new number is accepted to contribute to the average.
-		NewNumber(Option<AccountId>, u32),
+		NewPrice(Option<AccountId>, u32),
 	}
 );
 
@@ -183,7 +184,10 @@ decl_error! {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+
+
 		CanNotGetLock,
+		PriceParseError,
 	}
 }
 
@@ -192,37 +196,17 @@ decl_module! {
 		fn deposit_event() = default;
 
 		#[weight = 10000]
-		pub fn submit_number_signed(origin, number: u32) -> DispatchResult {
-			let who = ensure_signed(origin)?;
-			debug::info!("submit_number_signed: ({}, {:?})", number, who);
-			Self::append_or_replace_number(number);
-
-			Self::deposit_event(RawEvent::NewNumber(Some(who), number));
-			Ok(())
-		}
-
-		#[weight = 10000]
-		pub fn submit_number_unsigned(origin, number: u32) -> DispatchResult {
-			let _ = ensure_none(origin)?;
-			debug::info!("submit_number_unsigned: {}", number);
-			Self::append_or_replace_number(number);
-
-			Self::deposit_event(RawEvent::NewNumber(None, number));
-			Ok(())
-		}
-
-		#[weight = 10000]
 		pub fn submit_number_unsigned_with_signed_payload(origin, payload: Payload<T::Public>,
 			_signature: T::Signature) -> DispatchResult
 		{
 			let _ = ensure_none(origin)?;
 			// we don't need to verify the signature here because it has been verified in
 			//   `validate_unsigned` function when sending out the unsigned tx.
-			let Payload { number, public } = payload;
-			debug::info!("submit_number_unsigned_with_signed_payload: ({}, {:?})", number, public);
-			Self::append_or_replace_number(number);
+			let Payload { price, public } = payload;
+			debug::info!("submit_number_unsigned_with_signed_payload: ({}, {:?})", price, public);
+			Self::append_or_replace_price(price);
 
-			Self::deposit_event(RawEvent::NewNumber(None, number));
+			Self::deposit_event(RawEvent::NewPrice(None, price));
 			Ok(())
 		}
 
@@ -230,8 +214,8 @@ decl_module! {
 			debug::info!("Entering off-chain worker");
 			match Self::fetch_github_info() {
 				Ok(info) => {
-					debug::error!("[XXX_DEBUG] offchain_worker success: {:?}", info);
-					if let Err(err) = Self::offchain_unsigned_tx_signed_payload(block_number, info) {
+					debug::info!("[XXX_DEBUG] offchain_worker success: {:?}", info);
+					if let Err(err) = Self::offchain_unsigned_tx_signed_payload(info) {
 						debug::error!("[XXX_DEBUG] offchain_worker offchain_unsigned_tx_signed_payload error: {:?}", err);
 					}
 				},
@@ -246,13 +230,13 @@ decl_module! {
 impl<T: Trait> Module<T> {
 	/// Append a new number to the tail of the list, removing an element from the head if reaching
 	///   the bounded length.
-	fn append_or_replace_number(number: u32) {
-		Numbers::mutate(|numbers| {
-			if numbers.len() == NUM_VEC_LEN {
-				let _ = numbers.pop_front();
+	fn append_or_replace_price(price: u32) {
+		Prices::mutate(|prices| {
+			if prices.len() == NUM_VEC_LEN {
+				let _ = prices.pop_front();
 			}
-			numbers.push_back(number);
-			debug::info!("Number vector: {:?}", numbers);
+			prices.push_back(price);
+			debug::info!("[XXX_DEBUG] Prices vector: {:?}", prices);
 		});
 	}
 
@@ -363,58 +347,11 @@ impl<T: Trait> Module<T> {
 		Ok(response.body().collect::<Vec<u8>>())
 	}
 
-	fn offchain_signed_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
-		// We retrieve a signer and check if it is valid.
-		//   Since this pallet only has one key in the keystore. We use `any_account()1 to
-		//   retrieve it. If there are multiple keys and we want to pinpoint it, `with_filter()` can be chained,
-		//   ref: https://substrate.dev/rustdocs/v2.0.0/frame_system/offchain/struct.Signer.html
-		let signer = Signer::<T, T::AuthorityId>::any_account();
-
-		// Translating the current block number to number and submit it on-chain
-		let number: u32 = block_number.try_into().unwrap_or(0) as u32;
-
-		// `result` is in the type of `Option<(Account<T>, Result<(), ()>)>`. It is:
-		//   - `None`: no account is available for sending transaction
-		//   - `Some((account, Ok(())))`: transaction is successfully sent
-		//   - `Some((account, Err(())))`: error occured when sending the transaction
-		let result = signer.send_signed_transaction(|_acct|
-			// This is the on-chain function
-			Call::submit_number_signed(number)
-		);
-
-		// Display error if the signed tx fails.
-		if let Some((acc, res)) = result {
-			if res.is_err() {
-				debug::error!("failure: offchain_signed_tx: tx sent: {:?}", acc.id);
-				return Err(<Error<T>>::OffchainSignedTxError);
-			}
-			// Transaction is sent successfully
-			return Ok(());
-		}
-
-		// The case of `None`: no account is available for sending
-		debug::error!("No local account available");
-		Err(<Error<T>>::NoLocalAcctForSigning)
-	}
-
-	fn offchain_unsigned_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
-		let number: u32 = block_number.try_into().unwrap_or(0) as u32;
-		let call = Call::submit_number_unsigned(number);
-
-		// `submit_unsigned_transaction` returns a type of `Result<(), ()>`
-		//   ref: https://substrate.dev/rustdocs/v2.0.0/frame_system/offchain/struct.SubmitTransaction.html#method.submit_unsigned_transaction
-		SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
-			.map_err(|_| {
-				debug::error!("Failed in offchain_unsigned_tx");
-				<Error<T>>::OffchainUnsignedTxError
-			})
-	}
-
-	fn offchain_unsigned_tx_signed_payload(block_number: T::BlockNumber, price: DotPriceInfo) -> Result<(), Error<T>> {
+	fn offchain_unsigned_tx_signed_payload(price_info: DotPriceInfo) -> Result<(), Error<T>> {
 		// Retrieve the signer to sign the payload
 		let signer = Signer::<T, T::AuthorityId>::any_account();
 
-		let number: u32 = block_number.try_into().unwrap_or(0) as u32;
+		let price = Self::parse_price_info(&price_info)?;
 
 		// `send_unsigned_transaction` is returning a type of `Option<(Account<T>, Result<(), ()>)>`.
 		//   Similar to `send_signed_transaction`, they account for:
@@ -422,7 +359,7 @@ impl<T: Trait> Module<T> {
 		//   - `Some((account, Ok(())))`: transaction is successfully sent
 		//   - `Some((account, Err(())))`: error occured when sending the transaction
 		if let Some((_, res)) = signer.send_unsigned_transaction(
-			|acct| Payload { number, public: acct.public.clone() },
+			|acct| Payload { price, public: acct.public.clone() },
 			Call::submit_number_unsigned_with_signed_payload
 		) {
 			return res.map_err(|_| {
@@ -434,6 +371,12 @@ impl<T: Trait> Module<T> {
 		// The case of `None`: no account is available for sending
 		debug::error!("No local account available");
 		Err(<Error<T>>::NoLocalAcctForSigning)
+	}
+
+	fn parse_price_info(price_info: &DotPriceInfo) -> Result<u32, Error<T>> {
+		let price_str = str::from_utf8(&price_info.data.priceUsd).map_err(|_| <Error<T>>::PriceParseError)?;
+		let price: f32 = price_str.parse().map_err(|_| <Error<T>>::PriceParseError)?;
+		Ok((price * PRICE_ACC) as u32)
 	}
 }
 
@@ -449,7 +392,6 @@ impl<T: Trait> frame_support::unsigned::ValidateUnsigned for Module<T> {
 			.build();
 
 		match call {
-			Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
 			Call::submit_number_unsigned_with_signed_payload(ref payload, ref signature) => {
 				if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
 					return InvalidTransaction::BadProof.into();
